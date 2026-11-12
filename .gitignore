@@ -1,0 +1,31 @@
+# Environment variables
+.env
+.env.local
+.env*.local
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Browser automation
+browser-profile/
+.playwright/
+
+# Generated/temporary data
+data/
+*.log
+
+# Backup files
+*copy.js
+*backup.js
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
