@@ -14,6 +14,8 @@ const CONFIG = {
 
   minDelay: Number(process.env.MIN_DELAY_SECONDS || 30),
   maxDelay: Number(process.env.MAX_DELAY_SECONDS || 120),
+
+  maxErrors: 5,
 };
 
 const FIRSTCRY_API_URL = 'https://www.firstcry.com/api/shortlist';
@@ -22,6 +24,10 @@ const DATA_DIR = path.join(__dirname, 'data');
 const HISTORY_FILE = path.join(DATA_DIR, 'stock-history.json');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Global error tracking
+let errorCount = 0;
+let isStopping = false;
 
 // Validate configuration
 function validateConfig() {
@@ -59,7 +65,7 @@ function loadHistory() {
       return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
     }
   } catch (error) {
-    console.error('Unable to load stock history:', error.message);
+    throw new Error(`Stock history loading failed: ${error.message}`);
   }
 
   return {};
@@ -136,6 +142,62 @@ async function sendTelegramMessage(message, productUrl = null) {
   return result;
 }
 
+// Report errors to Telegram
+async function reportError(error, context) {
+  errorCount++;
+
+  const errorMessage = error instanceof Error ? error.message : String(error);
+
+  console.error('\n========== APPLICATION ERROR ==========');
+  console.error('Context:', context);
+  console.error('Error:', errorMessage);
+  console.error(`Error count: ${errorCount}/${CONFIG.maxErrors}`);
+
+  const notification = ['FIRSTCRY STOCK CHECKER ERROR', '', `Context: ${context}`, `Error: ${errorMessage}`, '', `Consecutive errors: ${errorCount}/${CONFIG.maxErrors}`, `Time: ${new Date().toLocaleString()}`].join('\n');
+
+  // Try to notify Telegram.
+  // Do not recursively count Telegram notification failures.
+  try {
+    await sendTelegramMessage(notification);
+    console.log('Error notification sent to Telegram.');
+  } catch (telegramError) {
+    console.error('Could not send error notification:', telegramError.message);
+  }
+
+  // Stop after reaching the error limit
+  if (errorCount >= CONFIG.maxErrors) {
+    console.error('\nMaximum error limit reached.');
+
+    await stopApplication(`Application stopped after ${CONFIG.maxErrors} consecutive errors.`);
+
+    return true;
+  }
+
+  return false;
+}
+
+// Stop application
+async function stopApplication(reason) {
+  if (isStopping) return;
+
+  isStopping = true;
+
+  console.error('\n==================================');
+  console.error('       APPLICATION STOPPING');
+  console.error('==================================');
+  console.error(reason);
+
+  try {
+    await sendTelegramMessage(['FIRSTCRY STOCK CHECKER STOPPED', '', reason, '', `Total consecutive errors: ${errorCount}`, `Time: ${new Date().toLocaleString()}`].join('\n'));
+
+    console.log('Shutdown notification sent to Telegram.');
+  } catch (error) {
+    console.error('Unable to send shutdown notification:', error.message);
+  }
+
+  process.exit(1);
+}
+
 // Fetch FirstCry shortlist
 async function fetchShortlist() {
   const response = await fetch(FIRSTCRY_API_URL, {
@@ -207,19 +269,18 @@ function getStockStatus(product) {
   };
 }
 
-// Build Telegram notification
+// Build stock notification
 function buildStockMessage(product, quantity) {
-  return ['🔥 HOT WHEELS STOCK ALERT', '', `Product: ${product.name || 'Unknown product'}`, `Available quantity: ${quantity}`, `Product ID: ${product.id}`, '', 'Status: IN STOCK'].join('\n');
+  return ['HOT WHEELS STOCK ALERT', '', `Product: ${product.name || 'Unknown product'}`, `Available quantity: ${quantity}`, `Product ID: ${product.id}`, '', 'Status: IN STOCK'].join('\n');
 }
 
-// Process products and notify when stock becomes available
+// Process products
 async function processProducts(products, history) {
   const checkedAt = new Date().toISOString();
 
   for (const product of products) {
     if (product.id === undefined || product.id === null) {
-      console.error('Skipping product without an ID');
-      continue;
+      throw new Error('Received a product without an ID');
     }
 
     const productId = String(product.id);
@@ -236,21 +297,14 @@ async function processProducts(products, history) {
 
     const becameAvailable = status === 'IN_STOCK' && (!previous || previous.status !== 'IN_STOCK');
 
-    // Send notification when product becomes available
+    // Notify when product becomes available
     if (becameAvailable) {
-      try {
-        const message = buildStockMessage(product, quantity);
-        const productUrl = getProductUrl(product);
+      const message = buildStockMessage(product, quantity);
+      const productUrl = getProductUrl(product);
 
-        await sendTelegramMessage(message, productUrl);
+      await sendTelegramMessage(message, productUrl);
 
-        console.log(`Telegram notification sent: ${productName}`);
-      } catch (error) {
-        console.error(`Telegram notification failed for ${productName}:`, error.message);
-
-        // Leave previous status unchanged so notification can retry
-        continue;
-      }
+      console.log(`Telegram notification sent: ${productName}`);
     }
 
     // Update stock history
@@ -276,19 +330,15 @@ async function main() {
   console.log('==================================');
   console.log(`Pincode: ${CONFIG.pincode}`);
   console.log(`Polling interval: ${CONFIG.minDelay}-${CONFIG.maxDelay} seconds`);
+  console.log(`Maximum consecutive errors: ${CONFIG.maxErrors}`);
   console.log('Telegram notifications: Enabled');
 
-  // Send startup notification
-  try {
-    await sendTelegramMessage('FirstCry Stock Checker started successfully.');
+  // Startup notification
+  await sendTelegramMessage('FirstCry Stock Checker started successfully.');
 
-    console.log('Telegram connection successful.');
-  } catch (error) {
-    console.error('Telegram startup notification failed:', error.message);
-    throw error;
-  }
+  console.log('Telegram connection successful.');
 
-  while (true) {
+  while (!isStopping) {
     console.log('\n========== NEW STOCK CHECK ==========');
     console.log('Time:', new Date().toLocaleString());
 
@@ -298,19 +348,25 @@ async function main() {
       console.log(`Products received: ${products.length}`);
 
       await processProducts(products, history);
-    } catch (error) {
-      console.error('Stock check failed:', error.message);
 
-      if ([401, 403].includes(error.statusCode)) {
-        console.error('FirstCry authentication failed. Refresh your session credentials.');
-        break;
+      // Reset consecutive error count after a successful full cycle
+      if (errorCount > 0) {
+        console.log('Stock check successful. Error counter reset.');
+        errorCount = 0;
       }
+    } catch (error) {
+      const stopped = await reportError(error, 'Stock checking / product processing');
 
-      if (error.statusCode === 429) {
-        console.error('FirstCry rate limit reached. Stopping further requests.');
-        break;
+      if (stopped) return;
+
+      // Stop immediately for authentication or rate-limit errors
+      if ([401, 403, 429].includes(error.statusCode)) {
+        await stopApplication(`FirstCry returned HTTP ${error.statusCode}. Manual intervention required.`);
+        return;
       }
     }
+
+    if (isStopping) return;
 
     const delay = getRandomDelay();
 
@@ -318,17 +374,40 @@ async function main() {
 
     await sleep(delay * 1000);
   }
-
-  console.log('Stock checker stopped.');
 }
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\nStock checker stopped by user.');
-  process.exit(0);
+// Handle unexpected uncaught exceptions
+process.on('uncaughtException', async (error) => {
+  console.error('Uncaught exception:', error);
+
+  if (!isStopping) {
+    await reportError(error, 'Uncaught exception');
+  }
 });
 
-main().catch((error) => {
-  console.error('Application error:', error.message);
-  process.exit(1);
+// Handle unhandled promise rejections
+process.on('unhandledRejection', async (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+
+  if (!isStopping) {
+    await reportError(reason, 'Unhandled promise rejection');
+  }
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  await stopApplication('Application stopped manually using SIGINT.');
+});
+
+process.on('SIGTERM', async () => {
+  await stopApplication('Application stopped using SIGTERM.');
+});
+
+// Start application
+main().catch(async (error) => {
+  console.error('Application startup failed:', error);
+
+  if (!isStopping) {
+    await reportError(error, 'Application startup');
+  }
 });
