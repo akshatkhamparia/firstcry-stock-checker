@@ -302,9 +302,22 @@ async function processProducts(products, history) {
       const message = buildStockMessage(product, quantity);
       const productUrl = getProductUrl(product);
 
-      await sendTelegramMessage(message, productUrl);
+      for (let i = 1; i <= 3; i++) {
+        try {
+          await sendTelegramMessage(`${message}\n\nNotification: ${i}/3`, productUrl);
 
-      console.log(`Telegram notification sent: ${productName}`);
+          console.log(`Telegram notification ${i}/3 sent: ${productName}`);
+
+          // Small gap between notifications
+          if (i < 3) {
+            await sleep(2000);
+          }
+        } catch (error) {
+          console.error(`Telegram notification ${i}/3 failed for ${productName}:`, error.message);
+
+          throw error;
+        }
+      }
     }
 
     // Update stock history
